@@ -23,6 +23,7 @@ pub struct ChunkDeserializer {
     current_stage: ParseStage,
     current_payload: MessagePayload,
     current_payload_data: BytesMut,
+    partial_payloads: HashMap<u32, BytesMut>,
     buffer: BytesMut,
     previous_headers: HashMap<u32, ChunkHeader>,
 }
@@ -63,6 +64,7 @@ impl ChunkDeserializer {
             previous_headers: HashMap::new(),
             current_payload: MessagePayload::new(),
             current_payload_data: BytesMut::new(),
+            partial_payloads: HashMap::new(),
         }
     }
 
@@ -220,6 +222,10 @@ impl ChunkDeserializer {
             },
         };
 
+        // Chunks from different chunk streams can be interleaved, so pick up any partially
+        // received message for this chunk stream.
+        self.current_payload_data = self.partial_payloads.remove(&csid).unwrap_or_default();
+
         let _ = self.buffer.split_to(next_index as usize);
         self.current_stage = ParseStage::InitialTimestamp;
         Ok(ParseStageResult::Success)
@@ -368,7 +374,15 @@ impl ChunkDeserializer {
     ) -> Result<ParseStageResult, ChunkDeserializationError> {
         let mut length = self.current_header.message_length as usize;
         let current_payload_length = self.current_payload_data.len();
-        let remaining_bytes = length - current_payload_length;
+        let remaining_bytes = match length.checked_sub(current_payload_length) {
+            Some(remaining) => remaining,
+            None => {
+                return Err(ChunkDeserializationError::InvalidMessageLength {
+                    csid: self.current_header.chunk_stream_id,
+                })
+            }
+        };
+
         if length > self.max_chunk_size as usize {
             length = min(remaining_bytes, self.max_chunk_size as usize);
         }
@@ -398,6 +412,11 @@ impl ChunkDeserializer {
 
             let payload = mem::replace(&mut self.current_payload, MessagePayload::new());
             *message_to_return = Some(payload)
+        } else {
+            // Hold on to the partial message until the next chunk on this chunk stream arrives
+            let partial = mem::replace(&mut self.current_payload_data, BytesMut::new());
+            self.partial_payloads
+                .insert(self.current_header.chunk_stream_id, partial);
         }
 
         // This completes the current chunk, so cycle the header into the map and start a new one
@@ -1152,5 +1171,55 @@ mod tests {
         }
 
         cursor.into_inner()
+    }
+
+    #[test]
+    fn can_read_interleaved_chunks_from_different_chunk_streams() {
+        let payload_a: Vec<u8> = (0..200).map(|x| x as u8).collect();
+        let payload_b: Vec<u8> = (0..200).map(|x| (x as u8).wrapping_add(100)).collect();
+
+        // Each message is a 12 byte type 0 header and 128 bytes of data, followed by a type 3
+        // chunk containing the remaining 72 bytes
+        let bytes_a = form_type_0_chunk(4, 10, 1, 8, &payload_a, 128);
+        let bytes_b = form_type_0_chunk(6, 20, 1, 9, &payload_b, 128);
+        let (a_first, a_rest) = bytes_a.split_at(12 + 128);
+        let (b_first, b_rest) = bytes_b.split_at(12 + 128);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(a_first);
+        bytes.extend_from_slice(b_first);
+        bytes.extend_from_slice(a_rest);
+        bytes.extend_from_slice(b_rest);
+
+        let mut deserializer = ChunkDeserializer::new();
+        let message_a = deserializer.get_next_message(&bytes).unwrap().unwrap();
+        let message_b = deserializer.get_next_message(&[]).unwrap().unwrap();
+        assert_eq!(deserializer.get_next_message(&[]).unwrap(), None);
+
+        assert_eq!(message_a.type_id, 8);
+        assert_eq!(message_a.timestamp, RtmpTimestamp::new(10));
+        assert_eq!(&message_a.data[..], &payload_a[..]);
+        assert_eq!(message_b.type_id, 9);
+        assert_eq!(message_b.timestamp, RtmpTimestamp::new(20));
+        assert_eq!(&message_b.data[..], &payload_b[..]);
+    }
+
+    #[test]
+    fn type_0_chunk_with_shorter_length_mid_message_returns_error() {
+        let long_payload = [1_u8; 200];
+        let short_payload = [2_u8; 50];
+
+        let long_bytes = form_type_0_chunk(4, 10, 1, 8, &long_payload, 128);
+        let short_bytes = form_type_0_chunk(4, 10, 1, 8, &short_payload, 128);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&long_bytes[..12 + 128]);
+        bytes.extend_from_slice(&short_bytes);
+
+        let mut deserializer = ChunkDeserializer::new();
+        match deserializer.get_next_message(&bytes) {
+            Err(ChunkDeserializationError::InvalidMessageLength { csid: 4 }) => (),
+            other => panic!("Expected InvalidMessageLength, got {:?}", other),
+        }
     }
 }
