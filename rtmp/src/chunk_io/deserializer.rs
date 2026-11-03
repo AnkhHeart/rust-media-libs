@@ -1,6 +1,6 @@
 use super::chunk_header::{ChunkHeader, ChunkHeaderFormat};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use chunk_io::ChunkDeserializationError;
 use messages::MessagePayload;
 use std::cmp::min;
@@ -10,6 +10,7 @@ use std::mem;
 
 const INITIAL_MAX_CHUNK_SIZE: usize = 128;
 const MAX_INITIAL_TIMESTAMP: u32 = 16777215;
+const MAX_PENDING_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Allows deserializing bytes representing RTMP chunks into RTMP message payloads.
 ///
@@ -24,6 +25,7 @@ pub struct ChunkDeserializer {
     current_payload: MessagePayload,
     current_payload_data: BytesMut,
     partial_payloads: HashMap<u32, BytesMut>,
+    pending_payload_bytes: usize,
     buffer: BytesMut,
     previous_headers: HashMap<u32, ChunkHeader>,
 }
@@ -65,6 +67,7 @@ impl ChunkDeserializer {
             current_payload: MessagePayload::new(),
             current_payload_data: BytesMut::new(),
             partial_payloads: HashMap::new(),
+            pending_payload_bytes: 0,
         }
     }
 
@@ -225,6 +228,7 @@ impl ChunkDeserializer {
         // Chunks from different chunk streams can be interleaved, so pick up any partially
         // received message for this chunk stream.
         self.current_payload_data = self.partial_payloads.remove(&csid).unwrap_or_default();
+        self.pending_payload_bytes -= self.current_payload_data.len();
 
         let _ = self.buffer.split_to(next_index as usize);
         self.current_stage = ParseStage::InitialTimestamp;
@@ -395,12 +399,9 @@ impl ChunkDeserializer {
         self.current_payload.type_id = self.current_header.message_type_id;
         self.current_payload.message_stream_id = self.current_header.message_stream_id;
 
-        // Make sure the we have enough capacity for the whole message data.  This
-        // helps with performance when there are smaller chunk sizes.
-        if remaining_bytes > self.current_payload_data.remaining_mut() {
-            let capacity_needed = remaining_bytes - self.current_payload_data.remaining_mut();
-            self.current_payload_data.reserve(capacity_needed);
-        }
+        // Only reserve what has actually arrived, so memory use follows the bytes received
+        // instead of the length a peer claims for the message.
+        self.current_payload_data.reserve(length);
 
         let bytes = self.buffer.split_to(length as usize);
         self.current_payload_data.extend_from_slice(&bytes[..]);
@@ -415,6 +416,11 @@ impl ChunkDeserializer {
         } else {
             // Hold on to the partial message until the next chunk on this chunk stream arrives
             let partial = mem::replace(&mut self.current_payload_data, BytesMut::new());
+            if partial.len() > MAX_PENDING_PAYLOAD_BYTES - self.pending_payload_bytes {
+                return Err(ChunkDeserializationError::TooMuchPendingData);
+            }
+
+            self.pending_payload_bytes += partial.len();
             self.partial_payloads
                 .insert(self.current_header.chunk_stream_id, partial);
         }
@@ -1220,6 +1226,41 @@ mod tests {
         match deserializer.get_next_message(&bytes) {
             Err(ChunkDeserializationError::InvalidMessageLength { csid: 4 }) => (),
             other => panic!("Expected InvalidMessageLength, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_when_too_much_partial_data_is_pending_across_chunk_streams() {
+        let chunk_size = 65536;
+        let mut deserializer = ChunkDeserializer::new();
+        deserializer.set_max_chunk_size(chunk_size).unwrap();
+
+        let mut result = Ok(None);
+        for csid in 3..300_u32 {
+            // Each chunk stream declares a 16MB message but only sends its first chunk
+            let mut bytes = Vec::new();
+            if csid < 64 {
+                bytes.push(csid as u8);
+            } else {
+                bytes.push(0);
+                bytes.push((csid - 64) as u8);
+            }
+            bytes.write_u24::<BigEndian>(0).unwrap();
+            bytes.write_u24::<BigEndian>(0xFFFFFF).unwrap();
+            bytes.push(9);
+            bytes.write_u32::<LittleEndian>(1).unwrap();
+            bytes.extend(vec![0_u8; chunk_size]);
+
+            result = deserializer.get_next_message(&bytes);
+            assert!(deserializer.pending_payload_bytes <= MAX_PENDING_PAYLOAD_BYTES);
+            if result.is_err() {
+                break;
+            }
+        }
+
+        match result {
+            Err(ChunkDeserializationError::TooMuchPendingData) => (),
+            other => panic!("Expected TooMuchPendingData, got {:?}", other),
         }
     }
 }
