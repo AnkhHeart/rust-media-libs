@@ -29,6 +29,11 @@ pub enum Amf0DeserializationError {
     /// UTF-8 this error will be raised.
     #[error("Failed to read a utf8 string from the byte buffer: {0}")]
     StringParseError(#[from] string::FromUtf8Error),
+
+    /// Objects and arrays can contain other objects and arrays.  To avoid exhausting the stack
+    /// this error is raised when values are nested more than 32 levels deep.
+    #[error("Objects or arrays are nested too deeply")]
+    NestingTooDeep,
 }
 
 /// Errors raised during to the serialization process
