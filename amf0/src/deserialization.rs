@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use Amf0Value;
 
+/// The maximum number of nested objects and arrays that will be deserialized.
+const MAX_NESTING_DEPTH: u32 = 32;
+
 struct ObjectProperty {
     label: String,
     value: Amf0Value,
@@ -19,7 +22,7 @@ pub fn deserialize<R: Read>(bytes: &mut R) -> Result<Vec<Amf0Value>, Amf0Deseria
     let mut results = vec![];
 
     loop {
-        match read_next_value(bytes)? {
+        match read_next_value(bytes, 0)? {
             Some(x) => results.push(x),
             None => break,
         };
@@ -28,7 +31,10 @@ pub fn deserialize<R: Read>(bytes: &mut R) -> Result<Vec<Amf0Value>, Amf0Deseria
     Ok(results)
 }
 
-fn read_next_value<R: Read>(bytes: &mut R) -> Result<Option<Amf0Value>, Amf0DeserializationError> {
+fn read_next_value<R: Read>(
+    bytes: &mut R,
+    depth: u32,
+) -> Result<Option<Amf0Value>, Amf0DeserializationError> {
     let mut buffer: [u8; 1] = [0];
     let bytes_read = bytes.read(&mut buffer)?;
 
@@ -40,15 +46,23 @@ fn read_next_value<R: Read>(bytes: &mut R) -> Result<Option<Amf0Value>, Amf0Dese
         return Ok(None);
     }
 
+    let is_container = matches!(
+        buffer[0],
+        markers::OBJECT_MARKER | markers::ECMA_ARRAY_MARKER | markers::STRICT_ARRAY_MARKER
+    );
+    if is_container && depth >= MAX_NESTING_DEPTH {
+        return Err(Amf0DeserializationError::NestingTooDeep);
+    }
+
     match buffer[0] {
         markers::BOOLEAN_MARKER => parse_bool(bytes).map(Some),
         markers::NULL_MARKER => parse_null().map(Some),
         markers::UNDEFINED_MARKER => parse_undefined().map(Some),
         markers::NUMBER_MARKER => parse_number(bytes).map(Some),
-        markers::OBJECT_MARKER => parse_object(bytes).map(Some),
-        markers::ECMA_ARRAY_MARKER => parse_ecma_array(bytes).map(Some),
+        markers::OBJECT_MARKER => parse_object(bytes, depth + 1).map(Some),
+        markers::ECMA_ARRAY_MARKER => parse_ecma_array(bytes, depth + 1).map(Some),
         markers::STRING_MARKER => parse_string(bytes).map(Some),
-        markers::STRICT_ARRAY_MARKER => parse_strict_array(bytes).map(Some),
+        markers::STRICT_ARRAY_MARKER => parse_strict_array(bytes, depth + 1).map(Some),
         _ => Err(Amf0DeserializationError::UnknownMarker { marker: buffer[0] }),
     }
 }
@@ -87,11 +101,11 @@ fn parse_string<R: Read>(bytes: &mut R) -> Result<Amf0Value, Amf0Deserialization
     Ok(Amf0Value::Utf8String(value))
 }
 
-fn parse_object<R: Read>(bytes: &mut R) -> Result<Amf0Value, Amf0DeserializationError> {
+fn parse_object<R: Read>(bytes: &mut R, depth: u32) -> Result<Amf0Value, Amf0DeserializationError> {
     let mut properties = HashMap::new();
 
     loop {
-        match parse_object_property(bytes)? {
+        match parse_object_property(bytes, depth)? {
             Some(property) => properties.insert(property.label, property.value),
             None => break,
         };
@@ -101,7 +115,7 @@ fn parse_object<R: Read>(bytes: &mut R) -> Result<Amf0Value, Amf0Deserialization
     Ok(deserialized_value)
 }
 
-fn parse_ecma_array<R: Read>(bytes: &mut R) -> Result<Amf0Value, Amf0DeserializationError> {
+fn parse_ecma_array<R: Read>(bytes: &mut R, depth: u32) -> Result<Amf0Value, Amf0DeserializationError> {
     // An ECMA array is an array of values indexed via strings instead of numeric indexes (so
     // essentially a hash map).  It seems functionally equivalent to an object so for simplicity
     // treat it as such.
@@ -113,15 +127,15 @@ fn parse_ecma_array<R: Read>(bytes: &mut R) -> Result<Amf0Value, Amf0Deserializa
     // like we can ignore the associative count and just read exactly as we would an object.
 
     let _associative_count = bytes.read_u32::<BigEndian>()?;
-    parse_object(bytes)
+    parse_object(bytes, depth)
 }
 
-fn parse_strict_array<R: Read>(bytes: &mut R) -> Result<Amf0Value, Amf0DeserializationError> {
+fn parse_strict_array<R: Read>(bytes: &mut R, depth: u32) -> Result<Amf0Value, Amf0DeserializationError> {
     let _array_count = bytes.read_u32::<BigEndian>()?;
     let mut values: Vec<Amf0Value> = Vec::new();
 
     for _ in 0.._array_count {
-        match read_next_value(bytes)? {
+        match read_next_value(bytes, depth)? {
             Some(value) => {
                 values.push(value);
             }
@@ -134,6 +148,7 @@ fn parse_strict_array<R: Read>(bytes: &mut R) -> Result<Amf0Value, Amf0Deseriali
 
 fn parse_object_property<R: Read>(
     bytes: &mut R,
+    depth: u32,
 ) -> Result<Option<ObjectProperty>, Amf0DeserializationError> {
     let label_length = bytes.read_u16::<BigEndian>()?;
     if label_length == 0 {
@@ -152,7 +167,7 @@ fn parse_object_property<R: Read>(
 
     let label = String::from_utf8(label_buffer)?;
 
-    match read_next_value(bytes)? {
+    match read_next_value(bytes, depth)? {
         None => Err(Amf0DeserializationError::UnexpectedEof),
         Some(property_value) => Ok(Some(ObjectProperty {
             label,
@@ -165,6 +180,7 @@ fn parse_object_property<R: Read>(
 mod tests {
     use super::super::Amf0Value;
     use super::deserialize;
+    use errors::Amf0DeserializationError;
     use byteorder::{BigEndian, WriteBytesExt};
     use markers;
     use std::collections::HashMap;
@@ -329,5 +345,48 @@ mod tests {
 
         let expected = vec![Amf0Value::Undefined];
         assert_eq!(result, expected);
+    }
+
+    fn nested_strict_arrays(depth: usize) -> Vec<u8> {
+        let mut vector = vec![];
+        for _ in 1..depth {
+            vector.push(markers::STRICT_ARRAY_MARKER);
+            vector.write_u32::<BigEndian>(1).unwrap();
+        }
+
+        vector.push(markers::STRICT_ARRAY_MARKER);
+        vector.write_u32::<BigEndian>(0).unwrap();
+        vector
+    }
+
+    #[test]
+    fn can_deserialize_maximum_nesting_depth() {
+        let mut input = Cursor::new(nested_strict_arrays(32));
+        let result = deserialize(&mut input).unwrap();
+
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn deeply_nested_arrays_return_error_instead_of_overflowing_stack() {
+        let vector = nested_strict_arrays(50_000);
+
+        let result = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || deserialize(&mut Cursor::new(vector)).is_err())
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert!(result);
+    }
+
+    #[test]
+    fn nesting_beyond_maximum_depth_returns_nesting_too_deep() {
+        let mut input = Cursor::new(nested_strict_arrays(33));
+        match deserialize(&mut input) {
+            Err(Amf0DeserializationError::NestingTooDeep) => (),
+            other => panic!("Expected NestingTooDeep, got {:?}", other),
+        }
     }
 }

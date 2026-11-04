@@ -20,6 +20,16 @@ pub enum ChunkDeserializationError {
     #[error("Requested an invalid max chunk size of {chunk_size}.  The largest chunk size possible is 2147483647")]
     InvalidMaxChunkSize { chunk_size: usize },
 
+    /// A chunk declared a message length that is smaller than the amount of the message that was
+    /// already received on that chunk stream.
+    #[error("Received chunk on csid {csid} with a message length smaller than the data already received")]
+    InvalidMessageLength { csid: u32 },
+
+    /// The partially received messages across all chunk streams hold more data than is
+    /// allowed to be buffered at once.
+    #[error("Too much data is buffered for incomplete messages")]
+    TooMuchPendingData,
+
     /// An I/O error occurred while reading the input buffer
     #[error("{0}")]
     Io(#[from] io::Error),
